@@ -1,4 +1,5 @@
-import { BaseDAO, BaseModel, CacheAdapter, DaoError, configureDao, mapper } from "../src";
+import { BaseDAO, BaseModel, DaoError, configureDao, mapper } from "../src";
+import { memoryCache } from "./memory-cache";
 
 class Widget extends BaseModel {
     id?: string;
@@ -13,20 +14,6 @@ class WidgetDAO extends BaseDAO<Widget> {
 }
 
 class NoKeyWidgetDAO extends BaseDAO<Widget> {}
-
-function memoryCache(): CacheAdapter & { store: Map<string, unknown> } {
-    const store = new Map<string, unknown>();
-    return {
-        store,
-        get: <T>(key: string) => store.get(key) as T | undefined,
-        set: <T>(key: string, value: T) => {
-            store.set(key, value);
-        },
-        del: (key: string) => {
-            store.delete(key);
-        },
-    };
-}
 
 const widget = (id: string, name = "w") => Object.assign(new Widget(), { id, name });
 
