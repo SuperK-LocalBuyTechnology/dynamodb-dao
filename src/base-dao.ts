@@ -9,6 +9,7 @@ import {
 } from "@nova-odm/expressions";
 import {
     DataMapper,
+    getSchema,
     ParallelScanOptions,
     ParallelScanWorkerOptions,
     PutOptions,
@@ -16,7 +17,7 @@ import {
     ReadConsistency,
     ScanOptions,
 } from "@nova-odm/mapper";
-import { ZeroArgumentsConstructor } from "@nova-odm/marshaller";
+import { getSchemaName, SchemaType, ZeroArgumentsConstructor } from "@nova-odm/marshaller";
 import { v4 as uuidv4 } from "uuid";
 import { BaseModel } from "./base-model";
 import { CacheAdapter } from "./cache-adapter";
@@ -65,6 +66,11 @@ export type RecursivePartial<T> = {
 };
 
 export type PartialExcept<T, K extends keyof T> = RecursivePartial<T> & Pick<T, K>;
+
+export type NumericKeys<T> = { [K in keyof T]-?: NonNullable<T[K]> extends number ? K : never }[keyof T];
+
+const isVersionAttribute = (fieldSchema: SchemaType): boolean =>
+    fieldSchema.type === "Number" && Boolean(fieldSchema.versionAttribute);
 
 // DynamoDB errors that will never succeed on retry (bad request/item shape, missing resource, etc.)
 // as opposed to transient errors (throttling, timeouts) that the SDK's own maxAttempts backoff already handles.
@@ -601,6 +607,38 @@ export class BaseDAO<T extends BaseModel, K extends keyof T = any, R extends key
         const res = await mapper.executeUpdateExpression(updateExpression, primaryKey, valueConstructor);
 
         this.handleCacheOperation(res, storeInCache, cacheTtl);
+
+        return res;
+    }
+
+    // Atomically adds delta to a numeric attribute, starting from 0 when it is unset; a negative delta subtracts.
+    async updateNumericAttributeBy(
+        valueConstructor: ZeroArgumentsConstructor<T>,
+        primaryKey: { [propertyName: string]: any },
+        attributeName: NumericKeys<T>,
+        delta: number
+    ): Promise<T> {
+        const schema = getSchema(valueConstructor.prototype);
+        const name = attributeName as string;
+        const versionName = Object.keys(schema).find((key) => isVersionAttribute(schema[key]));
+        if (name === versionName) {
+            throw new Error(`Cannot update ${name} by a delta: it is the model's version attribute`);
+        }
+        const updateExpression = new UpdateExpression();
+        // Paths inside a SET value aren't renamed by the mapper, so the math reads the stored attribute name.
+        updateExpression.set(
+            name,
+            this.mathExpression(getSchemaName(name, schema), delta >= 0 ? "+" : "-", Math.abs(delta))
+        );
+        updateExpression.set("modifiedAt", parseFloat((Date.now() / 1000).toFixed(0)));
+        // A copy read before this update must fail its version check rather than write the old value back.
+        if (versionName) {
+            updateExpression.set(versionName, this.mathExpression(getSchemaName(versionName, schema), "+", 1));
+        }
+
+        const res = await mapper.executeUpdateExpression(updateExpression, primaryKey, valueConstructor);
+
+        this.handleCacheOperation(res, false);
 
         return res;
     }
