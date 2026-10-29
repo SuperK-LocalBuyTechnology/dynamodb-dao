@@ -1,6 +1,7 @@
 import { DynamoDB } from "@aws-sdk/client-dynamodb";
 import {
     AttributePath,
+    AttributeValue,
     ConditionExpression,
     ConditionExpressionPredicate,
     FunctionExpression,
@@ -9,6 +10,7 @@ import {
 } from "@nova-odm/expressions";
 import {
     DataMapper,
+    getSchema,
     ParallelScanOptions,
     ParallelScanWorkerOptions,
     PutOptions,
@@ -16,7 +18,7 @@ import {
     ReadConsistency,
     ScanOptions,
 } from "@nova-odm/mapper";
-import { ZeroArgumentsConstructor } from "@nova-odm/marshaller";
+import { isKey, marshallValue, ZeroArgumentsConstructor } from "@nova-odm/marshaller";
 import { v4 as uuidv4 } from "uuid";
 import { BaseModel } from "./base-model";
 import { CacheAdapter } from "./cache-adapter";
@@ -65,6 +67,9 @@ export type RecursivePartial<T> = {
 };
 
 export type PartialExcept<T, K extends keyof T> = RecursivePartial<T> & Pick<T, K>;
+
+/** The attributes of T that hold a number. */
+export type NumericKeys<T> = { [K in keyof T]-?: NonNullable<T[K]> extends number ? K : never }[keyof T];
 
 // DynamoDB errors that will never succeed on retry (bad request/item shape, missing resource, etc.)
 // as opposed to transient errors (throttling, timeouts) that the SDK's own maxAttempts backoff already handles.
@@ -524,6 +529,44 @@ export class BaseDAO<T extends BaseModel, K extends keyof T = any, R extends key
         return res;
     }
 
+    /** `update` that also removes the named attributes in the same UpdateItem, e.g. a sparse-index marker. */
+    async updateAndRemove(
+        item: T,
+        removeAttributes: (keyof T)[],
+        condition?: ConditionExpression,
+        storeInCache: boolean = false,
+        cacheTtl: number = 3600
+    ): Promise<T> {
+        item.modifiedAt = new Date();
+        const schema = getSchema(item);
+        const updateExpression = new UpdateExpression();
+        const primaryKey: { [propertyName: string]: any } = {};
+        for (const [name, fieldSchema] of Object.entries(schema)) {
+            const value = item[name as keyof T];
+            if (isKey(fieldSchema)) {
+                primaryKey[name] = value;
+            } else if (removeAttributes.includes(name as keyof T)) {
+                updateExpression.remove(name);
+            } else if (value !== undefined) {
+                const marshalled = marshallValue(fieldSchema, value);
+                if (marshalled) updateExpression.set(name, new AttributeValue(marshalled));
+            }
+        }
+
+        const res = await mapper.executeUpdateExpression(
+            updateExpression,
+            primaryKey,
+            item.constructor as ZeroArgumentsConstructor<T>,
+            { condition }
+        );
+
+        if (this.hashKeyName) {
+            this.handleCacheOperation(res, storeInCache, cacheTtl);
+        }
+
+        return res;
+    }
+
     /**
      * Persists a loaded item while REMOVING any attributes that are now unset (onMissing: "remove"), then
      * invalidates its cache. Use to clear a sparse-index marker: pass the marker name(s) in `attributeNames`
@@ -601,6 +644,25 @@ export class BaseDAO<T extends BaseModel, K extends keyof T = any, R extends key
         const res = await mapper.executeUpdateExpression(updateExpression, primaryKey, valueConstructor);
 
         this.handleCacheOperation(res, storeInCache, cacheTtl);
+
+        return res;
+    }
+
+    /** Atomically adds delta to a numeric attribute, starting from 0 when it is unset; a negative delta subtracts. */
+    async adjustNumericAttribute(
+        valueConstructor: ZeroArgumentsConstructor<T>,
+        primaryKey: { [propertyName: string]: any },
+        attributeName: NumericKeys<T>,
+        delta: number
+    ): Promise<T> {
+        const name = attributeName as string;
+        const updateExpression = new UpdateExpression();
+        updateExpression.set(name, this.mathExpression(name, delta >= 0 ? "+" : "-", Math.abs(delta)));
+        updateExpression.set("modifiedAt", parseFloat((Date.now() / 1000).toFixed(0)));
+
+        const res = await mapper.executeUpdateExpression(updateExpression, primaryKey, valueConstructor);
+
+        this.handleCacheOperation(res, false);
 
         return res;
     }
